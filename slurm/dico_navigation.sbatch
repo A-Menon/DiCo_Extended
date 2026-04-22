@@ -42,6 +42,12 @@ export LD_LIBRARY_PATH=$SP/nvidia/cusparselt/lib:$SP/nvidia/cudnn/lib:$SP/nvidia
 OUTDIR=$ROOT/logs/dico_baselines/navigation/${LABEL}/seed_${SEED}
 mkdir -p "$OUTDIR"
 
+RESTORE_ARG=""
+if [[ -f "$OUTDIR/latest.pt" ]]; then
+    RESTORE_ARG="experiment.restore_file=$OUTDIR/latest.pt"
+    echo "Resuming from checkpoint: $OUTDIR/latest.pt"
+fi
+
 cd "$RUNS"
 "$PYTHON" run_navigation_ippo.py \
   experiment.sampling_device=cuda \
@@ -49,7 +55,9 @@ cd "$RUNS"
   experiment.loggers='[csv]' \
   experiment.render=False \
   experiment.evaluation=True \
+  experiment.checkpoint_interval=600000 \
   experiment.max_n_frames=10000000 \
   model.desired_snd=$DESIRED_SND \
   seed=$SEED \
+  $RESTORE_ARG \
   hydra.run.dir="$OUTDIR"
