@@ -22,3 +22,17 @@ process_shared: True
 probabilistic: null
 # Parameter filled dynamically. Do not change. Depends on whether the algorithm scale_mapping.
 scale_mapping: null
+
+# ADiCo (Adaptive Diversity Control) parameters
+# Whether to enable ADiCo. When False, vanilla DiCo is used.
+use_adico: False
+# Adaptation strength. Controls how much uncertainty inflates diversity. alpha=0 recovers vanilla DiCo.
+adico_alpha: 1.0
+# Progress gate sharpness. Controls the sigmoid gate on learning progress. beta->0 disables progress gating.
+adico_beta: 5.0
+# RND embedding dimension
+rnd_embed_dim: 64
+# RND hidden layer dimension
+rnd_hidden_dim: 64
+# RND predictor learning rate
+rnd_lr: 0.001

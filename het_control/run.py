@@ -58,6 +58,33 @@ def get_experiment(cfg: DictConfig) -> Experiment:
     else:
         model_config.probabilistic = False
 
+    # Build callback list
+    callbacks = []
+
+    # ADiCo callback goes first so w(o) is available for other callbacks
+    if getattr(model_config, "use_adico", False):
+        callbacks.append(
+            ADiCoCallback(rnd_lr=getattr(model_config, "rnd_lr", 1e-3))
+        )
+
+    callbacks.extend(
+        [
+            SndCallback(),
+            NormLoggerCallback(),
+            ActionSpaceLoss(
+                use_action_loss=cfg.use_action_loss, action_loss_lr=cfg.action_loss_lr
+            ),
+        ]
+    )
+
+    if task_name == "vmas/simple_tag":
+        callbacks.append(
+            TagCurriculum(
+                cfg.simple_tag_freeze_policy_after_frames,
+                cfg.simple_tag_freeze_policy,
+            )
+        )
+
     experiment = Experiment(
         task=task_config,
         algorithm_config=algorithm_config,
@@ -65,23 +92,7 @@ def get_experiment(cfg: DictConfig) -> Experiment:
         critic_model_config=critic_model_config,
         seed=cfg.seed,
         config=experiment_config,
-        callbacks=[
-            SndCallback(),
-            NormLoggerCallback(),
-            ActionSpaceLoss(
-                use_action_loss=cfg.use_action_loss, action_loss_lr=cfg.action_loss_lr
-            ),
-        ]
-        + (
-            [
-                TagCurriculum(
-                    cfg.simple_tag_freeze_policy_after_frames,
-                    cfg.simple_tag_freeze_policy,
-                )
-            ]
-            if task_name == "vmas/simple_tag"
-            else []
-        ),
+        callbacks=callbacks,
     )
     return experiment
 

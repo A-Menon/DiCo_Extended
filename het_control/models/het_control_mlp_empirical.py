@@ -16,6 +16,7 @@ from torchrl.modules import MultiAgentMLP
 from benchmarl.models.common import Model, ModelConfig
 from het_control.snd import compute_behavioral_distance
 from het_control.utils import overflowing_logits_norm
+from het_control.rnd import RNDContainer, compute_diversity_weights
 from .utils import squash
 
 
@@ -30,9 +31,15 @@ class HetControlMlpEmpirical(Model):
         tau: float,
         bootstrap_from_desired_snd: bool,
         process_shared: bool,
+        use_adico: bool = False,
+        adico_alpha: float = 1.0,
+        adico_beta: float = 5.0,
+        rnd_embed_dim: int = 64,
+        rnd_hidden_dim: int = 64,
+        rnd_lr: float = 1e-3,
         **kwargs,
     ):
-        """DiCo policy model
+        """DiCo / ADiCo policy model
 
         Args:
             activation_class (Type[nn.Module]): activation class to be used.
@@ -47,6 +54,12 @@ class HetControlMlpEmpirical(Model):
             bootstrap_from_desired_snd (bool):  Whether on the first iteration the estimated SND should be bootstrapped
                 from the desired snd (True) or from the measured SND (False)
             process_shared (bool): Whether to process the homogeneous part of the policy with a tanh squashing operation to the action space domain
+            use_adico (bool): Whether to enable Adaptive Diversity Control
+            adico_alpha (float): ADiCo adaptation strength. alpha=0 recovers vanilla DiCo.
+            adico_beta (float): ADiCo progress gate sharpness. beta->0 disables learning progress gating.
+            rnd_embed_dim (int): RND embedding dimension
+            rnd_hidden_dim (int): RND hidden layer dimension
+            rnd_lr (float): RND predictor learning rate (used by ADiCoCallback)
         """
 
         super().__init__(**kwargs)
@@ -58,6 +71,12 @@ class HetControlMlpEmpirical(Model):
         self.tau = tau
         self.bootstrap_from_desired_snd = bootstrap_from_desired_snd
         self.process_shared = process_shared
+
+        # ADiCo parameters
+        self.use_adico = use_adico
+        self.adico_alpha = adico_alpha
+        self.adico_beta = adico_beta
+        self.rnd_lr = rnd_lr
 
         self.register_buffer(
             name="desired_snd",
@@ -101,6 +120,31 @@ class HetControlMlpEmpirical(Model):
             activation_class=self.activation_class,
             num_cells=self.num_cells,
         )  # Per-agent networks that output mean deviations from the shared policy
+
+        # ADiCo: RND networks and running statistics
+        if self.use_adico:
+            rnd_container = RNDContainer(
+                input_dim=self.input_features,
+                hidden_dim=rnd_hidden_dim,
+                embed_dim=rnd_embed_dim,
+                device=self.device,
+            )
+            # Use object.__setattr__ to bypass nn.Module registration
+            # This prevents RND parameters from leaking into the main optimizer
+            object.__setattr__(self, "rnd", rnd_container)
+
+            self.register_buffer(
+                name="rnd_mean",
+                tensor=torch.zeros(1, device=self.device, dtype=torch.float),
+            )
+            self.register_buffer(
+                name="rnd_std",
+                tensor=torch.ones(1, device=self.device, dtype=torch.float),
+            )
+            self.register_buffer(
+                name="rnd_delta_std",
+                tensor=torch.ones(1, device=self.device, dtype=torch.float),
+            )
 
     def _perform_checks(self):
         super()._perform_checks()
@@ -174,6 +218,27 @@ class HetControlMlpEmpirical(Model):
                 1,
             )
 
+        # ADiCo: apply observation-dependent diversity weight
+        if (
+            self.use_adico
+            and self.desired_snd > 0
+            and self.desired_snd != -1
+            and not distance.isnan().any()
+        ):
+            # Try to read precomputed weight from tensordict (on-policy path)
+            dw_key = (self.agent_group, "diversity_weight")
+            try:
+                w = tensordict.get(dw_key, None)
+            except (KeyError, AttributeError):
+                w = None
+
+            if w is None and torch.is_grad_enabled():
+                # Off-policy fallback: compute on-the-fly without learning progress
+                w = self._compute_diversity_weight_online(input)
+
+            if w is not None:
+                scaling_ratio = scaling_ratio * w.detach()
+
         if self.probabilistic:
             shared_loc, shared_scale = shared_out.chunk(2, -1)
 
@@ -211,6 +276,41 @@ class HetControlMlpEmpirical(Model):
 
         return tensordict
 
+    def _compute_diversity_weight_online(
+        self, obs: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute w(o) on-the-fly without learning progress (phi=0.5).
+
+        Used as fallback for off-policy training and evaluation.
+
+        Args:
+            obs: shape [*batch, n_agents, n_features]
+
+        Returns:
+            w: shape [*batch, n_agents, 1]
+        """
+        original_shape = obs.shape[:-1]  # [*batch, n_agents]
+        flat_obs = obs.reshape(-1, obs.shape[-1])  # [N, n_features]
+
+        # Ensure RND networks are on the right device
+        device = obs.device
+        if next(self.rnd.target.parameters()).device != device:
+            self.rnd.to(device)
+
+        w = compute_diversity_weights(
+            obs=flat_obs,
+            target=self.rnd.target,
+            predictor=self.rnd.predictor,
+            rnd_mean=self.rnd_mean,
+            rnd_std=self.rnd_std,
+            alpha=self.adico_alpha,
+            beta=self.adico_beta,
+            delta=None,  # No learning progress for online computation
+            delta_std=None,
+        )  # [N]
+
+        return w.reshape(*original_shape, 1)  # [*batch, n_agents, 1]
+
     def process_shared_out(self, logits: torch.Tensor):
         if not self.probabilistic and self.process_shared:
             return squash(
@@ -229,6 +329,25 @@ class HetControlMlpEmpirical(Model):
             return torch.cat([loc, scale], dim=-1)
         else:
             return logits
+
+    def state_dict(self, *args, **kwargs):
+        """Override to include RND network states in checkpoints."""
+        sd = super().state_dict(*args, **kwargs)
+        if self.use_adico:
+            sd["_rnd_target"] = self.rnd.target.state_dict()
+            sd["_rnd_predictor"] = self.rnd.predictor.state_dict()
+        return sd
+
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        """Override to restore RND network states from checkpoints."""
+        if self.use_adico:
+            rnd_target_sd = state_dict.pop("_rnd_target", None)
+            rnd_predictor_sd = state_dict.pop("_rnd_predictor", None)
+            if rnd_target_sd is not None:
+                self.rnd.target.load_state_dict(rnd_target_sd)
+            if rnd_predictor_sd is not None:
+                self.rnd.predictor.load_state_dict(rnd_predictor_sd)
+        super().load_state_dict(state_dict, *args, **kwargs)
 
     # @torch.no_grad()
     def estimate_snd(self, obs: torch.Tensor):
@@ -267,6 +386,14 @@ class HetControlMlpEmpiricalConfig(ModelConfig):
 
     probabilistic: Optional[bool] = MISSING
     scale_mapping: Optional[str] = MISSING
+
+    # ADiCo parameters (defaults preserve backward compatibility)
+    use_adico: bool = False
+    adico_alpha: float = 1.0
+    adico_beta: float = 5.0
+    rnd_embed_dim: int = 64
+    rnd_hidden_dim: int = 64
+    rnd_lr: float = 1e-3
 
     @staticmethod
     def associated_class():
