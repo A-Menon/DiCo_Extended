@@ -311,3 +311,19 @@ class ActionSpaceLoss(Callback):
 
         loss = max_overflowing_logits_norm.pow(2).mean()
         return loss
+
+
+class CADiCoAnnealCallback(Callback):
+    """Stamps the true frame count into the tensordict so the model
+    can read it for alpha annealing. This is the only reliable source
+    of the actual training frame count."""
+
+    def on_batch_collected(self, batch: TensorDictBase):
+        frames = self.experiment.total_frames
+        for group in self.experiment.group_map.keys():
+            batch.set(
+                (group, "total_frames"),
+                torch.tensor(frames, dtype=torch.float).expand(
+                    batch.get((group, "observation")).shape[:-1]
+                ),
+            )

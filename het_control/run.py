@@ -67,6 +67,10 @@ def get_experiment(cfg: DictConfig) -> Experiment:
             ADiCoCallback(rnd_lr=getattr(model_config, "rnd_lr", 1e-3))
         )
 
+    # CADiCo anneal callback stamps true frame count into tensordict
+    if getattr(model_config, "use_cadico", False):
+        callbacks.append(CADiCoAnnealCallback())
+
     callbacks.extend(
         [
             SndCallback(),

@@ -1,0 +1,25 @@
+defaults:
+  - experiment: het_control_experiment
+  - algorithm: ippo
+  - task: vmas/navigation
+  - model: hetcontrolmlpempirical
+  - model@critic_model: layers/mlp
+  - _self_
+
+seed: 0
+
+use_action_loss: True
+action_loss_lr: 0.00003
+
+model:
+  use_cadico: True
+  cadico_alpha: 0.3
+  cadico_alpha_start: 0.5
+  cadico_alpha_end: 0.1
+  cadico_anneal_start_frac: 0.1
+  cadico_anneal_end_frac: 0.75
+  cadico_total_frames: 10000000
+
+hydra:
+  searchpath:
+    - pkg://benchmarl/conf
